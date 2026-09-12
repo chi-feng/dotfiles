@@ -1,0 +1,5 @@
+# zsh caches and state that must never be committed
+.zcompdump*
+*.zwc
+.zsh_history
+.zsh_sessions/

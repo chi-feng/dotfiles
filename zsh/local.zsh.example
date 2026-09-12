@@ -1,0 +1,7 @@
+# Machine-local, private, non-secret settings. Copy this file to ~/.config/zsh/local.zsh
+# (mode 0600); ~/.zshenv sources it after the secrets load. Keep hostnames, profiles,
+# and ssh aliases here, and keep secrets in the store that `secrets` manages.
+
+# export AWS_PROFILE=my-profile
+# export SOME_SERVICE_URL=https://service.internal.example
+# alias sshbox="ssh me@10.0.0.2"
