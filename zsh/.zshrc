@@ -68,3 +68,10 @@ claude_dsp()    { claude --dangerously-skip-permissions "$@"; }
 # Codex CLI in the terminal uses its own profile so its MCP credentials stay separate
 # from the ChatGPT desktop app.
 codex() { command codex --profile cli "$@"; }
+
+# ~/.codex/AGENTS.md must stay a symlink to ~/.claude/CLAUDE.md (install.sh makes it). An
+# editor that saves through the link with a temp-file rename replaces it with a copy, and
+# the two tools drift again without any error, so every new shell checks the link.
+if [[ -d "$HOME/.codex" && "$(readlink "$HOME/.codex/AGENTS.md" 2>/dev/null)" != "$HOME/.claude/CLAUDE.md" ]]; then
+  print -u2 "warning: ~/.codex/AGENTS.md is not a symlink to ~/.claude/CLAUDE.md; run ~/dotfiles/install.sh"
+fi

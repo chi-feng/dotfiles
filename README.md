@@ -8,8 +8,9 @@ git clone https://github.com/chi-feng/dotfiles ~/dotfiles && ~/dotfiles/install.
 ```
 
 The installer symlinks `~/.zshenv`, `~/.zshrc`, and `~/.zprofile` (and `~/.gitconfig` on
-macOS), creates `~/.config/zsh/local.zsh` from the example, and moves any existing real
-file to a dated backup under `~/.local/state`.
+macOS), links `~/.codex/AGENTS.md` to `~/.claude/CLAUDE.md` when both tools are present so
+Codex and Claude Code read one global instruction file, creates `~/.config/zsh/local.zsh`
+from the example, and moves any existing real file to a dated backup under `~/.local/state`.
 
 ## Layout
 
