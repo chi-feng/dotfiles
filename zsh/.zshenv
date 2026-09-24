@@ -25,3 +25,10 @@ fi
 
 # Machine-local, private, non-secret settings (hosts, profiles, aliases). Not in the repo.
 [[ -r "$HOME/.config/zsh/local.zsh" ]] && source "$HOME/.config/zsh/local.zsh"
+
+# Agent shells (Claude Code sets CLAUDECODE, Codex sets CODEX_THREAD_ID) pass an
+# unmatched glob or a leading `=` word through unchanged. Interactive zsh aborts the
+# whole command line on either, which was the most frequent agent command failure.
+if [[ -n "$CLAUDECODE" || -n "$CODEX_THREAD_ID" ]]; then
+  unsetopt nomatch equals
+fi
