@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""linear: a compact Linear GraphQL client for agents and shells.
+
+Output is terse text meant to be read by a model: one line per issue in lists,
+one line per write. `linear help` prints the command summary. The API key comes
+from $LINEAR_API_KEY, else `secrets get LINEAR_API_KEY`.
+"""
+import argparse
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+API = "https://api.linear.app/graphql"
+PRIORITY = {0: "-", 1: "urgent", 2: "high", 3: "med", 4: "low"}
+PRIORITY_IN = {"none": 0, "urgent": 1, "high": 2, "med": 3, "medium": 3, "low": 4}
+CLOSED_TYPES = ["completed", "canceled", "duplicate"]
+TEAMS_TTL = 86400
+UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+USAGE = """\
+linear me
+linear issue ID [--comments N] [--comments-only] [--full] [--json]
+linear list [FILTERS] [--order updated|created] [--limit N] [--after CURSOR]
+linear search TEXT [FILTERS] [--in-comments] [--limit N] [--after CURSOR]
+  FILTERS: --team K --mine|--assignee WHO|--unassigned --open --state S,S --label L
+           --project P --cycle --since YYYY-MM-DD --archived
+linear create TEAM TITLE [--desc T|--desc-file F|-] [--state S] [--mine|--assignee WHO]
+            [--priority urgent|high|med|low|none] [--label L]... [--project P]
+            [--parent ID] [--estimate N] [--due YYYY-MM-DD] [--cycle]
+linear update ID [--title T] [--desc T|--desc-file F|-] [--state S] [--team K]
+            [--mine|--assignee WHO|--unassign] [--priority P] [--add-label L]... [--remove-label L]...
+            [--project P|--no-project] [--parent ID|--no-parent] [--estimate N]
+            [--due D|--no-due] [--cycle|--no-cycle]
+linear comment ID [TEXT|--file F|-] [--reply CID|--edit CID]    (CID: the 8-char id `issue` prints)
+linear relate ID blocks|blocked-by|related|duplicate-of ID    linear unrelate ID ID
+linear link ID URL [--title T]      linear subscribe|unsubscribe|archive ID
+linear teams | states TEAM | labels [TEAM] | users TEXT | projects [TEXT]
+linear gql QUERY|@FILE|- [--vars JSON]
+Writes print "ok ...". Errors go to stderr with exit 1. A list that has more rows ends with "more: --after CURSOR".
+"""
+
+
+class LinearError(Exception):
+    pass
+
+
+def _api_key():
+    key = os.environ.get("LINEAR_API_KEY")
+    if key:
+        return key
+    try:
+        return subprocess.run(["secrets", "get", "LINEAR_API_KEY"], capture_output=True,
+                              text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise LinearError("no LINEAR_API_KEY in the environment or `secrets`") from exc
+
+
+def http_gql(query, variables=None):
+    body = json.dumps({"query": query, "variables": variables or {}}).encode()
+    req = urllib.request.Request(API, data=body, headers={
+        "Authorization": _api_key(), "Content-Type": "application/json",
+        "User-Agent": "linear-cli/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read())
+        except ValueError:
+            raise LinearError(f"HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise LinearError(str(getattr(exc, "reason", exc))) from exc
+    if payload.get("errors"):
+        raise LinearError("; ".join(e.get("message", "?") for e in payload["errors"]))
+    return payload["data"]
+
+
+class FileCache:
+    """Caches team and state ids, which change rarely, to save a round trip."""
+
+    def __init__(self, path=pathlib.Path.home() / ".cache" / "linear-cli" / "teams.json"):
+        self.path = path
+
+    def get(self):
+        try:
+            data = json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            return None
+        return data["value"] if time.time() - data.get("at", 0) < TEAMS_TTL else None
+
+    def put(self, value):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps({"at": time.time(), "value": value}))
+
+
+class Client:
+    def __init__(self, gql, cache):
+        self.gql = gql
+        self.cache = cache
+        self._teams = None
+
+    def write(self, query, variables, field):
+        """Runs a mutation and fails unless the API reports success."""
+        result = self.gql(query, variables)[field]
+        if not result.get("success"):
+            raise LinearError(f"{field} reported no success")
+        return result
+
+    # Name resolution. Each resolver fails with the candidates so a caller can retry.
+
+    def teams(self, refresh=False):
+        if self._teams is None and not refresh and self.cache:
+            self._teams = self.cache.get()
+        if self._teams is None or refresh:
+            # 100 teams with 25 states each stays under Linear's query-complexity limit.
+            data = self.gql("query{teams(first:100){nodes{id key name states(first:25){nodes{id name type}}}}}")
+            self._teams = data["teams"]["nodes"]
+            if self.cache:
+                self.cache.put(self._teams)
+        return self._teams
+
+    def team(self, ref):
+        for refresh in (False, True):
+            for team in self.teams(refresh):
+                if ref.lower() in (team["key"].lower(), team["name"].lower()) or ref == team["id"]:
+                    return team
+        raise LinearError(f"no team {ref!r}; run `linear teams`")
+
+    def state_id(self, team_id, name):
+        for refresh in (False, True):
+            team = next((t for t in self.teams(refresh) if t["id"] == team_id), None)
+            states = team["states"]["nodes"] if team else []
+            exact = [s for s in states if s["name"].lower() == name.lower()]
+            prefix = [s for s in states if s["name"].lower().startswith(name.lower())]
+            match = exact or (prefix if len(prefix) == 1 else [])
+            if match:
+                return match[0]["id"]
+        raise LinearError(f"no state {name!r}: " + ", ".join(s["name"] for s in states))
+
+    def issue_ref(self, ident, comments=False):
+        extra = " comments(first:250){nodes{id}}" if comments else ""
+        data = self.gql(f"query($id:String!){{issue(id:$id){{id identifier team{{id key}}{extra}}}}}", {"id": ident})
+        if not data.get("issue"):
+            raise LinearError(f"no issue {ident}")
+        return data["issue"]
+
+    def user_id(self, who):
+        if who == "me":
+            return self.gql("query{viewer{id}}")["viewer"]["id"]
+        data = self.gql(
+            "query($q:String!){users(filter:{active:{eq:true},or:[{email:{eqIgnoreCase:$q}},"
+            "{displayName:{eqIgnoreCase:$q}},{name:{containsIgnoreCase:$q}}]}){nodes{id name email}}}",
+            {"q": who})
+        users = data["users"]["nodes"]
+        if len(users) != 1:
+            names = ", ".join(f"{u['name']} <{u['email']}>" for u in users) or "none"
+            raise LinearError(f"assignee {who!r} matched {len(users)} users: {names}")
+        return users[0]["id"]
+
+    def label_id(self, team_id, name):
+        data = self.gql("query($n:String!){issueLabels(filter:{name:{eqIgnoreCase:$n}}){nodes{id team{id}}}}",
+                        {"n": name})
+        labels = data["issueLabels"]["nodes"]
+        own = [l for l in labels if l["team"] and l["team"]["id"] == team_id]
+        shared = [l for l in labels if not l["team"]]
+        if not (own or shared):
+            raise LinearError(f"no label {name!r} for this team; run `linear labels TEAM`")
+        return (own or shared)[0]["id"]
+
+    def project_id(self, ref):
+        if UUID.match(ref):
+            return ref
+        data = self.gql("query($n:String!){projects(first:10,filter:{name:{containsIgnoreCase:$n}}){nodes{id name}}}",
+                        {"n": ref})
+        found = data["projects"]["nodes"]
+        exact = [p for p in found if p["name"].lower() == ref.lower()]
+        pick = exact if exact else found
+        if len(pick) == 1:
+            return pick[0]["id"]
+        listed = ", ".join(f"{p['name']} ({p['id']})" for p in pick) or "none"
+        raise LinearError(f"project {ref!r} matched {len(pick)}; pass one id: {listed}")
+
+    def cycle_id(self, team_id):
+        cycle = self.gql("query($id:String!){team(id:$id){activeCycle{id}}}", {"id": team_id})["team"]["activeCycle"]
+        if not cycle:
+            raise LinearError("the team has no active cycle")
+        return cycle["id"]
+
+    def comment_id(self, issue, short):
+        ids = [c["id"] for c in issue["comments"]["nodes"] if c["id"].startswith(short.lower())]
+        if len(ids) != 1:
+            raise LinearError(f"comment {short!r} matched {len(ids)} comments on {issue['identifier']}")
+        return ids[0]
+
+
+# Rendering.
+
+def _clip(text, limit, count=True):
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + (f"… [+{len(text) - limit} chars]" if count else "…")
+
+
+def _brief(issue):
+    return f"{issue['identifier']} {issue['state']['name']} {_clip(issue['title'], 70, count=False)}"
+
+
+def issue_row(i):
+    who = (i.get("assignee") or {}).get("displayName") or "-"
+    return "\t".join([i["identifier"], i["state"]["name"], PRIORITY.get(i["priority"], "-"), who,
+                      _clip(i["title"], 100, count=False)])
+
+
+def _link(a):
+    status = (a.get("metadata") or {}).get("status")
+    return f"{a['title']}{f' ({status})' if status else ''} <{a['url']}>"
+
+
+def render_issue(i, comments, full, comments_only):
+    lines = [f"{i['identifier']} {i['title']}"]
+    if not comments_only:
+        facts = [i["state"]["name"], PRIORITY.get(i["priority"], "-"),
+                 (i.get("assignee") or {}).get("name") or "unassigned", i["team"]["key"]]
+        if i.get("cycle"):
+            facts.append(f"cycle {i['cycle']['number']}")
+        if i.get("project"):
+            facts.append(f"project {i['project']['name']}")
+        labels = [l["name"] for l in i["labels"]["nodes"]]
+        if labels:
+            facts.append("labels " + ", ".join(labels))
+        if i.get("estimate") is not None:
+            facts.append(f"est {i['estimate']}")
+        if i.get("dueDate"):
+            facts.append(f"due {i['dueDate']}")
+        lines.append(" | ".join(facts))
+        if i.get("parent"):
+            lines.append(f"parent: {i['parent']['identifier']} {_clip(i['parent']['title'], 70, count=False)}")
+        kids = i["children"]["nodes"]
+        if kids:
+            lines.append("sub-issues: " + "; ".join(_brief(k) for k in kids))
+        groups = {}
+        out_names = {"blocks": "blocks", "related": "related", "duplicate": "duplicate of", "similar": "similar"}
+        in_names = {"blocks": "blocked by", "related": "related", "duplicate": "duplicated by", "similar": "similar"}
+        for r in i["relations"]["nodes"]:
+            groups.setdefault(out_names.get(r["type"], r["type"]), []).append(_brief(r["relatedIssue"]))
+        for r in i["inverseRelations"]["nodes"]:
+            groups.setdefault(in_names.get(r["type"], r["type"]), []).append(_brief(r["issue"]))
+        for name in ("blocked by", "blocks", "duplicate of", "duplicated by", "related", "similar"):
+            if name in groups:
+                lines.append(f"{name}: " + "; ".join(groups[name]))
+        links = [_link(a) for a in i["attachments"]["nodes"]]
+        links += [f"doc {d['title']} <{d['url']}>" for d in i["documents"]["nodes"]]
+        if links:
+            lines.append("links: " + "; ".join(links))
+        creator = (i.get("creator") or {}).get("name") or "?"
+        lines.append(f"{i['url']} (created {i['createdAt'][:10]} by {creator}, updated {i['updatedAt'][:10]})")
+        if i.get("description"):
+            lines += ["", i["description"].strip() if full else _clip(i["description"], 4000)]
+    # The API returns comments newest first; the view keeps the newest N, oldest first.
+    nodes = i["comments"]["nodes"]
+    shown = sorted(nodes[:comments], key=lambda c: c["createdAt"]) if comments else []
+    if shown:
+        older = " (older comments exist)" if len(nodes) > len(shown) else ""
+        lines += ["", f"comments, newest last{older}:"]
+        for c in shown:
+            who = (c.get("user") or {}).get("name") or "bot"
+            reply = f" re {c['parent']['id'][:8]}" if c.get("parent") else ""
+            body = c["body"].strip() if full else _clip(c["body"], 600)
+            lines.append(f"[{c['createdAt'][:10]} {who} {c['id'][:8]}{reply}] {body}")
+    return "\n".join(lines)
+
+
+ISSUE_FIELDS = """id identifier title url description priority estimate dueDate createdAt updatedAt
+state{name} assignee{name} creator{name} team{key} project{name} cycle{number} labels{nodes{name}}
+parent{identifier title} children{nodes{identifier title state{name}}}
+attachments{nodes{title url metadata}} documents{nodes{title url}}
+relations{nodes{type relatedIssue{identifier title state{name}}}}
+inverseRelations{nodes{type issue{identifier title state{name}}}}"""
+ROW_FIELDS = "identifier title priority state{name} assignee{displayName}"
+
+
+# Commands.
+
+def _text_arg(inline, path):
+    try:
+        if path == "-" or inline == "-":
+            return sys.stdin.read()
+        if path:
+            return pathlib.Path(path).read_text()
+    except OSError as exc:
+        raise LinearError(f"cannot read {path}: {exc.strerror}") from exc
+    return inline
+
+
+def _issue_input(c, a, team_id, creating):
+    inp = {}
+    if not creating and a.team:
+        team_id = c.team(a.team)["id"]
+        inp["teamId"] = team_id
+    if not creating and a.title:
+        inp["title"] = a.title
+    desc = _text_arg(a.desc, a.desc_file)
+    if desc is not None:
+        inp["description"] = desc
+    if a.state:
+        inp["stateId"] = c.state_id(team_id, a.state)
+    if a.mine or a.assignee:
+        inp["assigneeId"] = c.user_id("me" if a.mine else a.assignee)
+    if getattr(a, "unassign", False):
+        inp["assigneeId"] = None
+    if a.priority:
+        if a.priority not in PRIORITY_IN:
+            raise LinearError("priority is one of urgent, high, med, low, none")
+        inp["priority"] = PRIORITY_IN[a.priority]
+    if a.project:
+        inp["projectId"] = c.project_id(a.project)
+    if a.parent:
+        inp["parentId"] = c.issue_ref(a.parent)["id"]
+    if a.estimate is not None:
+        inp["estimate"] = a.estimate
+    if a.due:
+        inp["dueDate"] = a.due
+    if a.cycle:
+        inp["cycleId"] = c.cycle_id(team_id)
+    if creating and a.label:
+        inp["labelIds"] = [c.label_id(team_id, name) for name in a.label]
+    if not creating:
+        for flag, field in (("no_project", "projectId"), ("no_parent", "parentId"),
+                            ("no_due", "dueDate"), ("no_cycle", "cycleId")):
+            if getattr(a, flag):
+                inp[field] = None
+        if a.add_label:
+            inp["addedLabelIds"] = [c.label_id(team_id, name) for name in a.add_label]
+        if a.remove_label:
+            inp["removedLabelIds"] = [c.label_id(team_id, name) for name in a.remove_label]
+    return inp
+
+
+def _filter(c, a):
+    """Builds one IssueFilter from the shared list and search flags; every clause is ANDed."""
+    parts = []
+    if a.team:
+        parts.append({"team": {"id": {"eq": c.team(a.team)["id"]}}})
+    if a.open:
+        parts.append({"state": {"type": {"nin": CLOSED_TYPES}}})
+    if a.state:
+        parts.append({"state": {"or": [{"name": {"eqIgnoreCase": s.strip()}} for s in a.state.split(",")]}})
+    if a.mine:
+        parts.append({"assignee": {"isMe": {"eq": True}}})
+    elif a.assignee:
+        parts.append({"assignee": {"id": {"eq": c.user_id(a.assignee)}}})
+    elif a.unassigned:
+        parts.append({"assignee": {"null": True}})
+    if a.label:
+        parts.append({"labels": {"some": {"name": {"eqIgnoreCase": a.label}}}})
+    if a.project:
+        parts.append({"project": {"name": {"containsIgnoreCase": a.project}}})
+    if a.cycle:
+        parts.append({"cycle": {"isActive": {"eq": True}}})
+    if a.since:
+        parts.append({"updatedAt": {"gte": a.since}})
+    return {"and": parts} if parts else {}
+
+
+def _rows(conn, out):
+    for node in conn["nodes"]:
+        print(issue_row(node), file=out)
+    if not conn["nodes"]:
+        print("no issues", file=out)
+    if conn["pageInfo"]["hasNextPage"]:
+        print(f"more: --after {conn['pageInfo']['endCursor']}", file=out)
+
+
+def _ok(out, issue):
+    print(f"ok {issue['identifier']} {issue['url']}", file=out)
+
+
+def cmd(c, a, out):
+    if a.cmd == "me":
+        v = c.gql("query{viewer{name email displayName}}")["viewer"]
+        print(f"{v['name']} ({v['displayName']}) <{v['email']}>", file=out)
+    elif a.cmd == "issue":
+        n = max(a.comments, 0) + 1
+        data = c.gql(f"query($id:String!){{issue(id:$id){{{ISSUE_FIELDS} "
+                     f"comments(first:{n}){{nodes{{id createdAt body user{{name}} parent{{id}}}}}}}}}}", {"id": a.id})
+        issue = data.get("issue")
+        if not issue:
+            raise LinearError(f"no issue {a.id}")
+        if a.json:
+            issue["comments"]["nodes"] = issue["comments"]["nodes"][:max(a.comments, 0)]
+            print(json.dumps(issue, separators=(",", ":")), file=out)
+        else:
+            print(render_issue(issue, a.comments, a.full, a.comments_only), file=out)
+    elif a.cmd == "list":
+        order = "createdAt" if a.order == "created" else "updatedAt"
+        data = c.gql(f"query($filter:IssueFilter,$n:Int,$after:String,$arch:Boolean){{issues(filter:$filter,"
+                     f"first:$n,after:$after,includeArchived:$arch,orderBy:{order})"
+                     f"{{nodes{{{ROW_FIELDS}}} pageInfo{{hasNextPage endCursor}}}}}}",
+                     {"filter": _filter(c, a), "n": a.limit, "after": a.after, "arch": a.archived})
+        _rows(data["issues"], out)
+    elif a.cmd == "search":
+        data = c.gql(f"query($t:String!,$filter:IssueFilter,$n:Int,$after:String,$c:Boolean,$arch:Boolean)"
+                     f"{{searchIssues(term:$t,filter:$filter,first:$n,after:$after,includeComments:$c,"
+                     f"includeArchived:$arch){{nodes{{{ROW_FIELDS}}} pageInfo{{hasNextPage endCursor}}}}}}",
+                     {"t": a.text, "filter": _filter(c, a), "n": a.limit, "after": a.after,
+                      "c": a.in_comments, "arch": a.archived})
+        _rows(data["searchIssues"], out)
+    elif a.cmd == "create":
+        team = c.team(a.team)
+        inp = {"teamId": team["id"], "title": a.title, **_issue_input(c, a, team["id"], True)}
+        res = c.write("mutation($input:IssueCreateInput!){issueCreate(input:$input){success issue{identifier url}}}",
+                      {"input": inp}, "issueCreate")
+        _ok(out, res["issue"])
+    elif a.cmd == "update":
+        ref = c.issue_ref(a.id)
+        inp = _issue_input(c, a, ref["team"]["id"], False)
+        if not inp:
+            raise LinearError("nothing to update")
+        res = c.write("mutation($id:String!,$input:IssueUpdateInput!){issueUpdate(id:$id,input:$input)"
+                      "{success issue{identifier url}}}", {"id": ref["id"], "input": inp}, "issueUpdate")
+        _ok(out, res["issue"])
+    elif a.cmd == "comment":
+        body = _text_arg(a.text, a.file)
+        if not body or not body.strip():
+            raise LinearError("empty comment")
+        issue = c.issue_ref(a.id, comments=bool(a.reply or a.edit))
+        if a.edit:
+            res = c.write("mutation($id:String!,$input:CommentUpdateInput!){commentUpdate(id:$id,input:$input)"
+                          "{success comment{url}}}", {"id": c.comment_id(issue, a.edit), "input": {"body": body}},
+                          "commentUpdate")
+        else:
+            inp = {"issueId": issue["id"], "body": body}
+            if a.reply:
+                inp["parentId"] = c.comment_id(issue, a.reply)
+            res = c.write("mutation($input:CommentCreateInput!){commentCreate(input:$input){success comment{url}}}",
+                          {"input": inp}, "commentCreate")
+        print(f"ok {res['comment']['url']}", file=out)
+    elif a.cmd == "relate":
+        types = {"blocks": "blocks", "blocked-by": "blocks", "related": "related", "duplicate-of": "duplicate"}
+        if a.type not in types:
+            raise LinearError("relation is one of " + ", ".join(types))
+        left, right = c.issue_ref(a.id)["id"], c.issue_ref(a.other)["id"]
+        if a.type == "blocked-by":
+            left, right = right, left
+        c.write("mutation($input:IssueRelationCreateInput!){issueRelationCreate(input:$input){success}}",
+                {"input": {"issueId": left, "relatedIssueId": right, "type": types[a.type]}}, "issueRelationCreate")
+        print(f"ok {a.id} {a.type} {a.other}", file=out)
+    elif a.cmd == "unrelate":
+        data = c.gql("query($id:String!){issue(id:$id){relations{nodes{id relatedIssue{identifier}}}"
+                     "inverseRelations{nodes{id issue{identifier}}}}}", {"id": a.id})["issue"]
+        if not data:
+            raise LinearError(f"no issue {a.id}")
+        other = a.other.upper()
+        ids = [r["id"] for r in data["relations"]["nodes"] if r["relatedIssue"]["identifier"] == other]
+        ids += [r["id"] for r in data["inverseRelations"]["nodes"] if r["issue"]["identifier"] == other]
+        if not ids:
+            raise LinearError(f"{a.id} has no relation to {a.other}")
+        for rid in ids:
+            c.write("mutation($id:String!){issueRelationDelete(id:$id){success}}", {"id": rid}, "issueRelationDelete")
+        print(f"ok removed {len(ids)} relation(s)", file=out)
+    elif a.cmd == "link":
+        c.write("mutation($i:String!,$u:String!,$t:String){attachmentLinkURL(issueId:$i,url:$u,title:$t){success}}",
+                {"i": c.issue_ref(a.id)["id"], "u": a.url, "t": a.title}, "attachmentLinkURL")
+        print(f"ok {a.id} {a.url}", file=out)
+    elif a.cmd in ("subscribe", "unsubscribe", "archive"):
+        name = {"subscribe": "issueSubscribe", "unsubscribe": "issueUnsubscribe", "archive": "issueArchive"}[a.cmd]
+        c.write(f"mutation($id:String!){{{name}(id:$id){{success}}}}", {"id": c.issue_ref(a.id)["id"]}, name)
+        print(f"ok {a.cmd} {a.id}", file=out)
+    elif a.cmd == "teams":
+        for t in c.teams(refresh=True):
+            print(f"{t['key']}\t{t['name']}", file=out)
+    elif a.cmd == "states":
+        team = c.team(a.team)
+        print(", ".join(f"{s['name']} ({s['type']})" for s in team["states"]["nodes"]), file=out)
+    elif a.cmd == "labels":
+        flt = {"or": [{"team": {"id": {"eq": c.team(a.team)["id"]}}}, {"team": {"null": True}}]} if a.team else {}
+        labels = c.gql("query($f:IssueLabelFilter){issueLabels(first:250,filter:$f){nodes{name team{key}}}}",
+                       {"f": flt})["issueLabels"]["nodes"]
+        mixed = any(l["team"] for l in labels) and any(not l["team"] for l in labels)
+        names = sorted(l["name"] + ("*" if mixed and not l["team"] else "") for l in labels)
+        print(", ".join(names) + ("\n(* workspace label)" if mixed else ""), file=out)
+    elif a.cmd == "users":
+        data = c.gql("query($q:String!){users(filter:{active:{eq:true},or:[{name:{containsIgnoreCase:$q}},"
+                     "{email:{containsIgnoreCase:$q}},{displayName:{containsIgnoreCase:$q}}]}){nodes{name displayName email}}}",
+                     {"q": a.text})
+        for u in data["users"]["nodes"]:
+            print(f"{u['name']}\t{u['displayName']}\t{u['email']}", file=out)
+    elif a.cmd == "projects":
+        flt = {"name": {"containsIgnoreCase": a.text}} if a.text else {"state": {"nin": ["completed", "canceled"]}}
+        data = c.gql("query($f:ProjectFilter){projects(first:50,filter:$f){nodes{id name state lead{name}}}}",
+                     {"f": flt})
+        for p in data["projects"]["nodes"]:
+            print(f"{p['name']}\t{p['state']}\t{(p.get('lead') or {}).get('name') or '-'}\t{p['id']}", file=out)
+    elif a.cmd == "gql":
+        query = a.query
+        try:
+            if query == "-":
+                query = sys.stdin.read()
+            elif query.startswith("@"):
+                query = pathlib.Path(query[1:]).read_text()
+            variables = json.loads(a.vars) if a.vars else {}
+        except OSError as exc:
+            raise LinearError(f"cannot read {query[1:]}: {exc.strerror}") from exc
+        except ValueError as exc:
+            raise LinearError(f"--vars is not JSON: {exc}") from exc
+        print(json.dumps(c.gql(query, variables), separators=(",", ":")), file=out)
+
+
+def parser():
+    p = argparse.ArgumentParser(prog="linear", usage=USAGE, add_help=False)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("help")
+    sub.add_parser("me")
+    s = sub.add_parser("issue")
+    s.add_argument("id")
+    s.add_argument("--comments", type=int, default=3)
+    s.add_argument("--comments-only", action="store_true")
+    s.add_argument("--full", action="store_true")
+    s.add_argument("--json", action="store_true")
+    for name in ("list", "search"):
+        s = sub.add_parser(name)
+        if name == "search":
+            s.add_argument("text")
+            s.add_argument("--in-comments", action="store_true")
+        else:
+            s.add_argument("--order", choices=["updated", "created"], default="updated")
+        who = s.add_mutually_exclusive_group()
+        who.add_argument("--mine", action="store_true")
+        who.add_argument("--assignee")
+        who.add_argument("--unassigned", action="store_true")
+        s.add_argument("--team")
+        s.add_argument("--open", action="store_true")
+        s.add_argument("--state")
+        s.add_argument("--label")
+        s.add_argument("--project")
+        s.add_argument("--cycle", action="store_true")
+        s.add_argument("--since")
+        s.add_argument("--archived", action="store_true")
+        s.add_argument("--limit", type=int, default=25)
+        s.add_argument("--after")
+    for name in ("create", "update"):
+        s = sub.add_parser(name)
+        who = s.add_mutually_exclusive_group()
+        who.add_argument("--mine", action="store_true")
+        who.add_argument("--assignee")
+        desc = s.add_mutually_exclusive_group()
+        desc.add_argument("--desc")
+        desc.add_argument("--desc-file")
+        project = s.add_mutually_exclusive_group()
+        project.add_argument("--project")
+        parent = s.add_mutually_exclusive_group()
+        parent.add_argument("--parent")
+        due = s.add_mutually_exclusive_group()
+        due.add_argument("--due")
+        cycle = s.add_mutually_exclusive_group()
+        cycle.add_argument("--cycle", action="store_true")
+        if name == "create":
+            s.add_argument("team")
+            s.add_argument("title")
+            s.add_argument("--label", action="append")
+        else:
+            s.add_argument("id")
+            s.add_argument("--title")
+            s.add_argument("--team")
+            who.add_argument("--unassign", action="store_true")
+            project.add_argument("--no-project", action="store_true")
+            parent.add_argument("--no-parent", action="store_true")
+            due.add_argument("--no-due", action="store_true")
+            cycle.add_argument("--no-cycle", action="store_true")
+            s.add_argument("--add-label", action="append")
+            s.add_argument("--remove-label", action="append")
+        s.add_argument("--state")
+        s.add_argument("--priority")
+        s.add_argument("--estimate", type=float)
+    s = sub.add_parser("comment")
+    s.add_argument("id")
+    body = s.add_mutually_exclusive_group()
+    body.add_argument("text", nargs="?")
+    body.add_argument("--file")
+    target = s.add_mutually_exclusive_group()
+    target.add_argument("--reply")
+    target.add_argument("--edit")
+    s = sub.add_parser("relate")
+    s.add_argument("id")
+    s.add_argument("type")
+    s.add_argument("other")
+    s = sub.add_parser("unrelate")
+    s.add_argument("id")
+    s.add_argument("other")
+    s = sub.add_parser("link")
+    s.add_argument("id")
+    s.add_argument("url")
+    s.add_argument("--title")
+    for name in ("subscribe", "unsubscribe", "archive"):
+        sub.add_parser(name).add_argument("id")
+    sub.add_parser("teams")
+    sub.add_parser("states").add_argument("team")
+    sub.add_parser("labels").add_argument("team", nargs="?")
+    sub.add_parser("users").add_argument("text")
+    sub.add_parser("projects").add_argument("text", nargs="?")
+    s = sub.add_parser("gql")
+    s.add_argument("query")
+    s.add_argument("--vars")
+    return p
+
+
+def main(argv=None, gql=None, out=sys.stdout, err=sys.stderr, cache=FileCache()):
+    args = parser().parse_args(argv)
+    if args.cmd == "help":
+        print(USAGE, end="", file=out)
+        return 0
+    try:
+        cmd(Client(gql or http_gql, cache), args, out)
+    except LinearError as exc:
+        print(f"error: {exc}", file=err)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
